@@ -1,0 +1,21 @@
+# Python
+*.pyc
+*.pyo
+*.egg-info
+build/
+dist/
+
+# Visual Studio
+*.bak
+*.pyd
+*.pdb
+*.user
+*.vspscc
+*.vssscc
+*.ncb
+*.suo
+*.ilk
+*.exp
+*.lib
+[Dd]ebug*/
+[Rr]elease*/
