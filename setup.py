@@ -6,12 +6,11 @@ except ImportError:
 from distutils.core import Extension
 
 ext_modules = [
-    Extension('sparsecoll',
-              sources=['sparsecoll.cpp', 'sparsedict.cpp'],
-              depends=['sparsecoll.h', 'sparsedict.h'],
+    Extension('_sparsedict',
+              sources=['_sparsedict.c'],
               extra_compile_args = ['/Oi', '/Oy'])]
 
-setup(name='sparsecoll',
+setup(name='sparsedict',
       version='1.0',
       description='Memory-efficient python collections based on Google\'s sparsehash library.',
       author='Nikita Nemkin',
@@ -26,4 +25,5 @@ setup(name='sparsecoll',
           'Operating System :: OS Independent',
           'Programming Language :: Python',
           'Topic :: Software Development :: Libraries :: Python Modules'],
+      py_modules=['sparsedict'],
       ext_modules=ext_modules)
