@@ -47,7 +47,6 @@ typedef long Py_hash_t;
 
 #define SPARSEBLOCK_SIZE 48
 #define INITIAL_ITEMS 32 /* Largest power of 2 that fits in one sparseblock. */
-#define PERTURB_SHIFT 5
 
 /* Single dictionary entry. */
 typedef struct {
@@ -251,6 +250,20 @@ static dictentry entry_not_found = {NULL, NULL};
 Py_LOCAL(int) dict_resize(SparseDictObject *self, Py_ssize_t new_max_items);
 Py_LOCAL(int) dict_resize_delta(SparseDictObject *self, Py_ssize_t delta);
 
+/* Bit scrambling borrowed from msvcrt's xhash header.
+   XXX: 64 bit version. */
+Py_LOCAL_INLINE(size_t)
+hash_mix(size_t hash)
+{
+	long quot = (long)((hash ^ 0xdeadbeef) & LONG_MAX);
+	ldiv_t qrem = ldiv(quot, 127773);
+
+	qrem.rem = 16807 * qrem.rem - 2836 * qrem.quot;
+	if (qrem.rem < 0)
+		qrem.rem += LONG_MAX;
+	return (size_t)qrem.rem;
+}
+
 /* Same as _PyString_Equal but using the public API. */
 Py_LOCAL_INLINE(int)
 string_equal(PyObject *arg1, PyObject *arg2)
@@ -318,7 +331,7 @@ static dictentry *
 dict_lookup(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert)
 {
     /* NULL key will make it look like deleted entry. */
-    size_t i, perturb;
+    size_t i, num_probes = 0;
     size_t max_items_mask = (size_t)self->max_items - 1;
     dictentry *entry, *freeslot = NULL;
     sparseblock *blocks = self->blocks;
@@ -337,17 +350,16 @@ dict_lookup(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert)
                 return NULL;
         }
     }
-    i = perturb = (size_t)hash;
+    i = hash_mix((size_t)hash) & max_items_mask;
     for (;;) {
-        size_t index = i & max_items_mask;
-        entry = sparseblock_find(&blocks[index / SPARSEBLOCK_SIZE], index % SPARSEBLOCK_SIZE);
+        entry = sparseblock_find(&blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
         if (entry == NULL) {
             if (freeslot != NULL)
                 return freeslot;
             if (!insert)
                 return &entry_not_found;
 
-            entry = sparseblock_insert(&blocks[index / SPARSEBLOCK_SIZE], index % SPARSEBLOCK_SIZE);
+            entry = sparseblock_insert(&blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
             if (entry != NULL)
                 /* Mark as deleted to distinguish newly inserved from existing. */
                 entry->key = NULL;
@@ -375,8 +387,9 @@ dict_lookup(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert)
             /* entry->key == NULL, deleted entry */
             freeslot = entry;
 
-        i = 5 * i + perturb + 1;
-        perturb >>= PERTURB_SHIFT;
+        /* Quadratic probing */
+        ++num_probes;
+        i = (i + num_probes) & max_items_mask;
     }
     assert(0); /* NOT REACHED */
 }
@@ -387,7 +400,7 @@ dict_lookup_string(SparseDictObject *self, PyObject *key, Py_hash_t  hash, int i
 {
     dictentry *entry, *freeslot = NULL;
     sparseblock *blocks = self->blocks;
-    size_t i, perturb;
+    size_t i, num_probes = 0;
     size_t max_items_mask = (size_t)self->max_items - 1;
 
     if (!PyBytes_CheckExact(key)) {
@@ -401,17 +414,16 @@ dict_lookup_string(SparseDictObject *self, PyObject *key, Py_hash_t  hash, int i
             hash = PyObject_Hash(key);
     }
 
-    i = perturb = (size_t)hash;
+    i = hash_mix((size_t)hash) & max_items_mask;
     for (;;) {
-        size_t index = i & max_items_mask;
-        entry = sparseblock_find(&blocks[index / SPARSEBLOCK_SIZE], index % SPARSEBLOCK_SIZE);
+        entry = sparseblock_find(&blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
         if (entry == NULL) {
             if (freeslot != NULL)
                 return freeslot;
             if (!insert)
                 return &entry_not_found;
 
-            entry = sparseblock_insert(&blocks[index / SPARSEBLOCK_SIZE], index % SPARSEBLOCK_SIZE);
+            entry = sparseblock_insert(&blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
             if (entry != NULL)
                 entry->key = NULL;
             return entry;
@@ -421,9 +433,10 @@ dict_lookup_string(SparseDictObject *self, PyObject *key, Py_hash_t  hash, int i
         else if (entry->key == NULL && freeslot == NULL)
             /* Deleted entry */
             freeslot = entry;
-        
-        i = 5 * i + perturb + 1;
-        perturb >>= PERTURB_SHIFT;
+
+        /* Quadratic probing */
+        ++num_probes;
+        i = (i + num_probes) & max_items_mask;
     }
     assert(0); /* NOT REACHED */
 }
@@ -539,7 +552,7 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
     SparseDict_FOR(self, entry)
         dictentry *new_entry;
         Py_hash_t hash;
-        size_t i, perturb, index;
+        size_t i, num_probes = 0;
         PyObject *key = entry.key;
 
         if (PyBytes_CheckExact(key)) {
@@ -553,15 +566,13 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
                 goto Failed;
         }
 
-        i = perturb = (size_t)hash;
-        index = i & max_items_mask;
-        while (BIT_TEST(new_blocks[index / SPARSEBLOCK_SIZE].bitmap, index % SPARSEBLOCK_SIZE)) {
-            i = i * 5 + perturb + 1;
-            perturb >>= PERTURB_SHIFT;
-            index = i & max_items_mask;
+        i = hash_mix((size_t)hash) & max_items_mask;
+        while (BIT_TEST(new_blocks[i / SPARSEBLOCK_SIZE].bitmap, i % SPARSEBLOCK_SIZE)) {
+            ++num_probes;
+            i = (i + num_probes) & max_items_mask;
         }
 
-        new_entry = sparseblock_insert(&new_blocks[index / SPARSEBLOCK_SIZE], index % SPARSEBLOCK_SIZE);
+        new_entry = sparseblock_insert(&new_blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
         if (new_entry == NULL)
             goto Failed;
         *new_entry = entry;
