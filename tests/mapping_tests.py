@@ -1,7 +1,10 @@
 # tests common to dict and UserDict
+# borrowed from Python 2.7 test suite, changes:
+# * ordering (cmp != 0, le, ge, lt, gt) is not supported
+# * has_key() does not raise Py3k warning
+
 import unittest
 import UserDict
-from tests import support
 
 
 class BasicTestMappingProtocol(unittest.TestCase):
@@ -61,16 +64,16 @@ class BasicTestMappingProtocol(unittest.TestCase):
         for k in self.other:
             self.assertNotIn(k, d)
         #has_key
-        with support.check_py3k_warnings(quiet=True):
-            for k in self.reference:
-                self.assertTrue(d.has_key(k))
-            for k in self.other:
-                self.assertFalse(d.has_key(k))
+        for k in self.reference:
+            self.assertTrue(d.has_key(k))
+        for k in self.other:
+            self.assertFalse(d.has_key(k))
         #cmp
         self.assertEqual(cmp(p,p), 0)
         self.assertEqual(cmp(d,d), 0)
-        self.assertEqual(cmp(p,d), -1)
-        self.assertEqual(cmp(d,p), 1)
+        import sys
+        self.assertRaises(TypeError, lambda:cmp(p,d))
+        self.assertRaises(TypeError, lambda:cmp(d,p))
         #__non__zero__
         if p: self.fail("Empty mapping must compare to False")
         if not d: self.fail("Full mapping must compare to True")
@@ -305,6 +308,7 @@ class BasicTestMappingProtocol(unittest.TestCase):
 
 
 class TestMappingProtocol(BasicTestMappingProtocol):
+
     def test_constructor(self):
         BasicTestMappingProtocol.test_constructor(self)
         self.assertTrue(self._empty_mapping() is not self._empty_mapping())
@@ -642,25 +646,12 @@ class TestHashMappingProtocol(TestMappingProtocol):
         self.assertRaises(Exc, repr, d)
 
     def test_le(self):
-        self.assertTrue(not (self._empty_mapping() < self._empty_mapping()))
-        self.assertTrue(not (self._full_mapping({1: 2}) < self._full_mapping({1L: 2L})))
-
-        class Exc(Exception): pass
-
-        class BadCmp(object):
-            def __eq__(self, other):
-                raise Exc()
-            def __hash__(self):
-                return 42
-
-        d1 = self._full_mapping({BadCmp(): 1})
-        d2 = self._full_mapping({1: 1})
-        try:
-            d1 < d2
-        except Exc:
-            pass
-        else:
-            self.fail("< didn't raise Exc")
+        p = self._empty_mapping()
+        d = self._full_mapping({1: 2})
+        self.assertRaises(TypeError, lambda: p < d)
+        self.assertRaises(TypeError, lambda: p > d)
+        self.assertRaises(TypeError, lambda: p <= d)
+        self.assertRaises(TypeError, lambda: p >= d)
 
     def test_setdefault(self):
         TestMappingProtocol.test_setdefault(self)

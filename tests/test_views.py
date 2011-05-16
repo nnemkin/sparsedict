@@ -1,5 +1,11 @@
+# tests for key, value and item views
+# borrowed from Python 2.7 test suite, changes:
+#   * test SparseDict() instead of dict()
+#   * do not use set literal syntax
+
 import unittest
 from sparsedict import SparseDict
+
 
 class SparseDictSetTest(unittest.TestCase):
 
