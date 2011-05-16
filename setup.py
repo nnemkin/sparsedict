@@ -1,14 +1,12 @@
 
 try:
-	from setuptools import setup
+    from setuptools import setup
 except ImportError:
-	from distutils.core import setup, Extension
+    from distutils.core import setup, Extension
 from distutils.core import Extension
 
 ext_modules = [
-    Extension('_sparsedict',
-              sources=['_sparsedict.c'],
-              extra_compile_args = ['/Oi', '/Oy'])]
+    Extension('_sparsedict', sources=['_sparsedict.c'])]
 
 setup(name='sparsedict',
       version='1.0',

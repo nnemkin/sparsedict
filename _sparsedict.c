@@ -1,15 +1,15 @@
 /* Hash table (dictionary) with low memory overhead.
 
-   Uses the same idea as the google-sparsehash (http://code.google.com/p/google-sparsehash/).
-   It's also very similar (and borrows portions of code from) python's native dict.
-
-   TODO:
-	* try dict() collision resolution scheme
-    * cleanup error messages
+   Uses the same algorithms and data structures as the sparse_hash_map
+   from google-sparsehash (http://code.google.com/p/google-sparsehash/).
+   It's also very similar to (and borrows portions of code from) python's builtin dict.
 */
 
 #include "Python.h"
-//#pragma warning(4 : 4710 4711 4714)
+
+#ifdef _MSC_VER
+#pragma warning(disable : 4232) /* taking dllimport address */
+#endif
 
 /* Python versions compatibility */
 #if PY_VERSION_HEX < 0x02060000
@@ -31,7 +31,7 @@
 #if PY_VERSION_HEX < 0x03020000
 typedef long Py_hash_t;
 #define PyArg_ValidateKeywordArguments(kwds) 1
-#endif 
+#endif
 #if PY_MAJOR_VERSION < 3
 #define PyDict_GetItemWithError PyDict_GetItem
 #else
@@ -44,10 +44,16 @@ typedef long Py_hash_t;
 #define Py_TPFLAGS_CHECKTYPES 0
 #endif
 
-/* Behavioral con */
+/* Behavioral constants */
 
 #define SPARSEBLOCK_SIZE 48
 #define INITIAL_ITEMS 32 /* Largest power of 2 that fits in one sparseblock. */
+
+#ifdef COLLECT_EX_STATS
+#define EX_STATS(stmt) stmt
+#else
+#define EX_STATS(stmt)
+#endif
 
 /* Single dictionary entry. */
 typedef struct {
@@ -75,6 +81,9 @@ struct _sparsedictobject {
     Py_ssize_t next_index;  /* Index in hash space to resume search for nondeleted items. Used by popitem. */
     sparseblock *blocks;
     sparseblock static_blocks[1]; /* Spare block to avoid allocations for "empty" state. */
+
+    EX_STATS(size_t total_collisions;)
+    EX_STATS(size_t total_resizes;)
 };
 
 /* Number of items is always a power of 2 >= INITIAL_ITEMS therefore
@@ -172,7 +181,7 @@ sparseblock_insert(sparseblock *block, Py_ssize_t index)
     /* Shift to make place for new item. */
     for (i = num_items - 1; i > offset; --i)
         items[i] = items[i-1];
-   
+
     return &items[offset];
 }
 
@@ -206,6 +215,8 @@ PyTypeObject SparseDictItems_Type;
         (sdict)->num_items = 0; \
         (sdict)->num_deleted = 0; \
         (sdict)->next_index = 0; \
+        EX_STATS((sdict)->total_collisions = 0); \
+        EX_STATS((sdict)->total_resizes = 0); \
         memset((sdict)->static_blocks, 0, sizeof(sparseblock)); \
         SparseDict_INIT_NONZERO(sdict); \
     } while (0)
@@ -383,13 +394,14 @@ dict_lookup(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert)
                 return dict_lookup(self, key, hash, insert);
             }
         }
-        else if (freeslot == NULL) 
+        else if (freeslot == NULL)
             /* entry->key == NULL, deleted entry */
             freeslot = entry;
 
         /* Quadratic probing */
         ++num_probes;
         i = (i + num_probes) & max_items_mask;
+        EX_STATS(++self->total_collisions);
     }
     assert(0); /* NOT REACHED */
 }
@@ -437,6 +449,7 @@ dict_lookup_string(SparseDictObject *self, PyObject *key, Py_hash_t  hash, int i
         /* Quadratic probing */
         ++num_probes;
         i = (i + num_probes) & max_items_mask;
+        EX_STATS(++self->total_collisions);
     }
     assert(0); /* NOT REACHED */
 }
@@ -587,8 +600,9 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
     self->num_blocks = num_blocks;
     self->num_items -= self->num_deleted;
     self->num_deleted = 0;
-    self->_max_items = new_max_items | self->_max_items & FLAGS_MASK; /* Preserve flags */
+    self->_max_items = new_max_items | (self->_max_items & FLAGS_MASK); /* Preserve flags */
 
+    EX_STATS(++self->total_resizes);
     SparseDict_INVARIANT(self);
     return 0;
 
@@ -675,7 +689,7 @@ dict_merge(SparseDictObject *self, PyObject *arg)
 
         if (dict_resize_delta(self, SparseDict_SIZE(other) - SparseDict_SIZE(self)) != 0)
             return -1;
-    
+
         SparseDict_FOR(other, entry)
             Py_INCREF(entry.key);
             Py_INCREF(entry.value);
@@ -831,7 +845,7 @@ static SparseDictObject *
 dict_tp_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 {
     SparseDictObject *self;
-    
+
     self = (SparseDictObject *)type->tp_alloc(type, 0);
     if (self != NULL) {
         /* tp_alloc zero-initialized out struct */
@@ -864,7 +878,7 @@ dict_tp_dealloc(SparseDictObject *self)
         Py_DECREF(entry.key);
         Py_DECREF(entry.value);
         /* destructive FOR frees the blocks for us */
-    SparseDict_ENDFOR(self, 1) 
+    SparseDict_ENDFOR(self, 1)
 
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -955,24 +969,28 @@ dict_tp_richcompare(PyObject *arg1, PyObject *arg2, int op)
     int cmp;
     PyObject *result;
 
-	if (op != Py_EQ && op != Py_NE) {
-		PyErr_SetString(PyExc_TypeError, "SparseDict only support equality and inequality");
-		return NULL;
-	}
+    if (op == Py_EQ || op == Py_NE) {
+        if (SparseDict_Check(arg1))
+            cmp = dict_equal((SparseDictObject *)arg1, arg2);
+        else if (SparseDict_Check(arg2))
+            cmp = dict_equal((SparseDictObject *)arg2, arg1);
+        else
+            cmp = 0;
 
-	if (SparseDict_Check(arg1))
-        cmp = dict_equal((SparseDictObject *)arg1, arg2);
-	else if (SparseDict_Check(arg2))
-		cmp = dict_equal((SparseDictObject *)arg2, arg1);
-    else
-        cmp = -1;
-
-	if (cmp != -1)
-		result = (cmp ^ (op == Py_NE)) ? Py_True : Py_False;
-	else
-		result = Py_NotImplemented;
-	Py_INCREF(result);
-	return result;
+        if (cmp < 0)
+            return NULL;
+        result = (cmp == (op == Py_EQ)) ? Py_True : Py_False;
+    }
+    else {
+#if PY_MAJOR_VERSION < 3
+        PyErr_SetString(PyExc_TypeError, "SparseDict does not support order comparison");
+        return NULL;
+#else
+        result = Py_NotImplemented;
+#endif
+    }
+    Py_INCREF(result);
+    return result;
 }
 
 static int
@@ -1301,7 +1319,7 @@ dict_py_popitem(SparseDictObject *self)
         return NULL;
     if (SparseDict_SIZE(self) == 0) {
         Py_DECREF(pair);
-        PyErr_SetString(PyExc_KeyError, "popitem(): SparseDict is empty");
+        PyErr_SetString(PyExc_KeyError, "popitem(): dictionary is empty");
         return NULL;
     }
 
@@ -1319,13 +1337,13 @@ static PyObject *
 dict_py_resize(SparseDictObject *self, PyObject *arg)
 {
     Py_ssize_t size = PyInt_AsSsize_t(arg);
-	if (size < 0) {
-		PyErr_SetString(PyExc_ValueError, "Argument to resize() must be a nonnegative integer.");
-		return NULL;
-	}
+    if (size < 0) {
+        PyErr_SetString(PyExc_ValueError, "resize(): argument must be a nonnegative integer");
+        return NULL;
+    }
     if (dict_resize_delta(self, size - SparseDict_SIZE(self)) < 0)
-		return NULL;
-	Py_RETURN_NONE;
+        return NULL;
+    Py_RETURN_NONE;
 }
 
 static PyObject *
@@ -1374,25 +1392,54 @@ dict_py_sizeof(SparseDictObject *self)
     return PyInt_FromSsize_t(result);
 }
 
+Py_LOCAL_INLINE(void)
+pydict_set_and_delete(PyObject *dict, const char *key, PyObject *value) {
+    if (value != NULL) {
+        PyDict_SetItemString(dict, key, value);
+        Py_DECREF(value);
+    }
+}
+
 static PyObject *
-dict_py_dump(SparseDictObject *self)
+dict_py_stats(SparseDictObject *self)
 {
-    Py_ssize_t i, hist_max = 0;
-    Py_ssize_t hist[SPARSEBLOCK_SIZE+1] = { 0 };
+    Py_ssize_t i;
+    Py_ssize_t hist[SPARSEBLOCK_SIZE + 1] = { 0 };
+    PyObject *hist_list, *value;
+    PyObject *result = PyDict_New();
+
+    if (result == NULL)
+        return NULL;
+
+    pydict_set_and_delete(result, "block_size", PyLong_FromLong(SPARSEBLOCK_SIZE));
+    pydict_set_and_delete(result, "num_blocks", PyLong_FromSsize_t(self->num_blocks));
+    pydict_set_and_delete(result, "max_items", PyLong_FromSsize_t(SparseDict_MAX_ITEMS(self)));
+    pydict_set_and_delete(result, "num_items", PyLong_FromSsize_t(self->num_items));
+    pydict_set_and_delete(result, "num_deleted", PyLong_FromSsize_t(self->num_deleted));
+    pydict_set_and_delete(result, "consider_shrink", PyBool_FromLong(self->_max_items & FLAG_CONSIDER_SHRINK));
+    pydict_set_and_delete(result, "string_lookup", PyBool_FromLong(self->lookup == dict_lookup_string));
+    EX_STATS(pydict_set_and_delete(result, "total_collisions", PyLong_FromSize_t(self->total_collisions)));
+    EX_STATS(pydict_set_and_delete(result, "total_resizes", PyLong_FromSize_t(self->total_resizes)));
+
+    hist_list = PyList_New(SPARSEBLOCK_SIZE + 1);
+    if (hist_list == NULL) {
+        Py_DECREF(result);
+        return NULL;
+    }
     for (i = 0; i < self->num_blocks; ++i)
         ++hist[self->blocks[i].num_items];
+    for (i = 0; i <= SPARSEBLOCK_SIZE; ++i) {
+        value = PyLong_FromSsize_t(hist[i]);
+        if (value == NULL) {
+            Py_DECREF(result);
+            Py_DECREF(hist_list);
+            return NULL;
+        }
+        PyList_SET_ITEM(hist_list, i, value);
+    }
+    pydict_set_and_delete(result, "blocks_by_size", hist_list);
 
-    for (i = 0; i <= SPARSEBLOCK_SIZE; ++i)
-        if (hist[i] > hist_max)
-            hist_max = hist[i];
-
-    fprintf(stderr, "\n\nSparseDict:\nmax_items = %d\nnum_items = %d\nnum_blocks = %d\n",
-        SparseDict_MAX_ITEMS(self), self->num_items, self->num_blocks);
-    fprintf(stderr, "block size distribution:\n");
-    for (i = 0; i <= SPARSEBLOCK_SIZE; ++i)
-        fprintf(stderr, "%4d: %-4d %10d\n", i, hist[i]);
-
-    Py_RETURN_NONE;
+    return result;
 }
 
 static PyMethodDef dict_methods[] = {
@@ -1408,7 +1455,7 @@ static PyMethodDef dict_methods[] = {
     {"clear",       (PyCFunction)dict_py_clear,        METH_NOARGS},
     {"copy",        (PyCFunction)dict_py_copy,         METH_NOARGS},
     {"resize",      (PyCFunction)dict_py_resize,       METH_O},
-    {"dump",      (PyCFunction)dict_py_dump,       METH_NOARGS},
+    {"_stats",      (PyCFunction)dict_py_stats,        METH_NOARGS},
 #if PY_MAJOR_VERSION < 3
     {"has_key",     (PyCFunction)dict_py_contains,     METH_O},
     {"keys",        (PyCFunction)dict_py_keys,         METH_NOARGS},
@@ -2223,27 +2270,27 @@ PyTypeObject SparseDictValues_Type = {
 Py_LOCAL(int)
 sparsedict_register(PyObject *module)
 {
-	if (PyType_Ready(&SparseDict_Type) != 0 ||
-		PyType_Ready(&SparseDictIterKey_Type) != 0 ||
-		PyType_Ready(&SparseDictIterValue_Type) != 0 ||
-		PyType_Ready(&SparseDictIterItem_Type) != 0 ||
+    if (PyType_Ready(&SparseDict_Type) != 0 ||
+        PyType_Ready(&SparseDictIterKey_Type) != 0 ||
+        PyType_Ready(&SparseDictIterValue_Type) != 0 ||
+        PyType_Ready(&SparseDictIterItem_Type) != 0 ||
         PyType_Ready(&SparseDictKeys_Type) != 0 ||
-		PyType_Ready(&SparseDictValues_Type) != 0 ||
-		PyType_Ready(&SparseDictItems_Type) != 0)
+        PyType_Ready(&SparseDictValues_Type) != 0 ||
+        PyType_Ready(&SparseDictItems_Type) != 0)
         return -1;
 
     Py_INCREF(&SparseDict_Type);
     PyModule_AddObject(module, "SparseDict", (PyObject *)&SparseDict_Type);
-    
+
     return 0;
 }
 
 #if PY_MAJOR_VERSION < 3
 PyMODINIT_FUNC init_sparsedict(void)
 {
-	PyObject *module = Py_InitModule("_sparsedict", NULL);
-	if (module == NULL)
-		return;
+    PyObject *module = Py_InitModule("_sparsedict", NULL);
+    if (module == NULL)
+        return;
 
     if (sparsedict_register(module) != 0)
         return;
@@ -2251,13 +2298,13 @@ PyMODINIT_FUNC init_sparsedict(void)
 #else
 PyMODINIT_FUNC PyInit__sparsedict()
 {
-	static PyModuleDef module_def = {
-		PyModuleDef_HEAD_INIT,
-		"_sparsedict",
-	};
-	PyObject *module = PyModule_Create(&module_def);
-	if (module == NULL)
-		return NULL;
+    static PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "_sparsedict",
+    };
+    PyObject *module = PyModule_Create(&module_def);
+    if (module == NULL)
+        return NULL;
 
     if (sparsedict_register(module) != 0)
         return NULL;
