@@ -41,6 +41,7 @@ typedef long Py_hash_t;
 #define PyString_FromFormat          PyUnicode_FromFormat
 #define PyString_Concat              PyUnicode_Append
 #define _PyString_Join               PyUnicode_Join
+#define Py_TPFLAGS_CHECKTYPES 0
 #endif
 
 /* Behavioral con */
@@ -67,15 +68,19 @@ struct _sparsedictobject {
     PyObject_HEAD
 
     dictentry *(*lookup)(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert);
-
     Py_ssize_t num_blocks;  /* Chunks of hash space by SPARSEBLOCK_SIZE items. */
     Py_ssize_t num_items;   /* Total number of alocated items in all blocks. */
     Py_ssize_t num_deleted; /* Number of deleted items (allocated, but have NULL key). */
-    Py_ssize_t max_items;   /* Max items possible without resizing the blocks array. */
+    Py_ssize_t _max_items;   /* Max items possible without resizing the blocks array. Lower bits hold the flags. */
     Py_ssize_t next_index;  /* Index in hash space to resume search for nondeleted items. Used by popitem. */
     sparseblock *blocks;
     sparseblock static_blocks[1]; /* Spare block to avoid allocations for "empty" state. */
 };
+
+/* Number of items is always a power of 2 >= INITIAL_ITEMS therefore
+   we have the lower bits available for flags. */
+#define FLAG_CONSIDER_SHRINK 1 /* Set in dict_delete, cleared in dict_resize_delta. */
+#define FLAGS_MASK           1
 
 /* sparseblock methods */
 
@@ -186,10 +191,13 @@ PyTypeObject SparseDictItems_Type;
 #define SparseDictViewSet_Check(op) \
     (Py_TYPE(op) == &SparseDictKeys_Type || Py_TYPE(op) == &SparseDictItems_Type)
 
+#define SparseDict_MAX_ITEMS(sdict) ((sdict)->_max_items & ~FLAGS_MASK)
+#define SparseDict_SIZE(sdict) ((sdict)->num_items - (sdict)->num_deleted)
+
 #define SparseDict_INIT_NONZERO(sdict) \
     do { \
         (sdict)->num_blocks = 1; \
-        (sdict)->max_items = INITIAL_ITEMS; \
+        (sdict)->_max_items = INITIAL_ITEMS; \
         (sdict)->blocks = (sdict)->static_blocks; \
     } while (0)
 
@@ -209,13 +217,11 @@ PyTypeObject SparseDictItems_Type;
         assert(SparseDict_Check(sdict)); \
         assert((sdict)->lookup != NULL); \
         assert((sdict)->blocks != NULL); \
-        assert((sdict)->max_items >= INITIAL_ITEMS); \
-        assert(((sdict)->max_items & ((sdict)->max_items - 1)) == 0); /* power of 2 */ \
-        assert((sdict)->num_items <= (sdict)->max_items); \
+        assert(SparseDict_MAX_ITEMS(sdict) >= INITIAL_ITEMS); \
+        assert((SparseDict_MAX_ITEMS(sdict) & (SparseDict_MAX_ITEMS(sdict) - 1)) == 0); /* power of 2 */ \
+        assert((sdict)->num_items <= SparseDict_MAX_ITEMS(sdict)); \
         assert((sdict)->num_deleted <= (sdict)->num_items); \
     } while (0)
-
-#define SparseDict_SIZE(sdict) ((sdict)->num_items - (sdict)->num_deleted)
 
 #define SparseDict_FOR(sdict, entry) \
     { \
@@ -250,18 +256,12 @@ static dictentry entry_not_found = {NULL, NULL};
 Py_LOCAL(int) dict_resize(SparseDictObject *self, Py_ssize_t new_max_items);
 Py_LOCAL(int) dict_resize_delta(SparseDictObject *self, Py_ssize_t delta);
 
-/* Bit scrambling borrowed from msvcrt's xhash header.
-   XXX: 64 bit version. */
+/* Integer hash based on PRNG. Used as a post-processing step for not so uniform Python's hashes. */
 Py_LOCAL_INLINE(size_t)
-hash_mix(size_t hash)
+hash_mix(Py_hash_t hash)
 {
-	long quot = (long)((hash ^ 0xdeadbeef) & LONG_MAX);
-	ldiv_t qrem = ldiv(quot, 127773);
-
-	qrem.rem = 16807 * qrem.rem - 2836 * qrem.quot;
-	if (qrem.rem < 0)
-		qrem.rem += LONG_MAX;
-	return (size_t)qrem.rem;
+    /* On 32-bit platforms, only lower 32 bits are used. */
+    return (size_t)(2862933555777941757ull * (unsigned PY_LONG_LONG)hash + 3037000493ul);
 }
 
 /* Same as _PyString_Equal but using the public API. */
@@ -332,7 +332,7 @@ dict_lookup(SparseDictObject *self, PyObject *key, Py_hash_t hash, int insert)
 {
     /* NULL key will make it look like deleted entry. */
     size_t i, num_probes = 0;
-    size_t max_items_mask = (size_t)self->max_items - 1;
+    size_t max_items_mask = (size_t)SparseDict_MAX_ITEMS(self) - 1;
     dictentry *entry, *freeslot = NULL;
     sparseblock *blocks = self->blocks;
     int cmp;
@@ -401,7 +401,7 @@ dict_lookup_string(SparseDictObject *self, PyObject *key, Py_hash_t  hash, int i
     dictentry *entry, *freeslot = NULL;
     sparseblock *blocks = self->blocks;
     size_t i, num_probes = 0;
-    size_t max_items_mask = (size_t)self->max_items - 1;
+    size_t max_items_mask = (size_t)SparseDict_MAX_ITEMS(self) - 1;
 
     if (!PyBytes_CheckExact(key)) {
         /* First non-string key, revert to universal lookup. */
@@ -497,6 +497,7 @@ dict_delete(SparseDictObject *self, PyObject *key)
     old_value = entry->value;
     entry->key = NULL;
     ++self->num_deleted;
+    self->_max_items |= FLAG_CONSIDER_SHRINK;
     Py_DECREF(old_value);
     Py_DECREF(old_key);
     return 0;
@@ -505,22 +506,27 @@ dict_delete(SparseDictObject *self, PyObject *key)
 /* This is caled to preallocate space for at least delta elements. */
 Py_LOCAL(int)
 dict_resize_delta(SparseDictObject *self, Py_ssize_t delta) {
-    /* Growth factor us 3/4 = 0.75, shrink factor is 5/16 = 0.3125 */
+    /* Growth factor is 3/4 = 0.75, shrink factor is 5/16 = 0.3125 */
 
-    Py_ssize_t new_max_items = self->max_items;
+    Py_ssize_t new_max_items = SparseDict_MAX_ITEMS(self);
 
     if (delta <= 0)
         return 0;
 
-    if (/*SparseDict_SIZE(self) > new_max_items * 5 / 16 &&*/
-        self->num_items + delta <= new_max_items * 3 / 4)
+    if (self->_max_items & FLAG_CONSIDER_SHRINK) {
+        self->_max_items &= ~FLAG_CONSIDER_SHRINK;
+        if (SparseDict_SIZE(self) < new_max_items * 5 / 16)
+            goto Resize;
+    }
+    if (self->num_items + delta <= new_max_items * 3 / 4)
         return 0;
 
+Resize:
     /* Find the size which fits nondeleted items below enlarge threshold. */
     new_max_items = INITIAL_ITEMS;
     while (SparseDict_SIZE(self) + delta > new_max_items * 3 / 4)
         new_max_items *= 2;
-    if (new_max_items < self->max_items) {
+    if (new_max_items < SparseDict_MAX_ITEMS(self)) {
         /* We're actually shrinking due to lots of deleted elements. Try to re-grow. */
         if (SparseDict_SIZE(self) + delta >= new_max_items * 2 * 5 / 16)
             /* Doubling the size won't hit shrink limit. */
@@ -540,7 +546,6 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
     sparseblock *new_blocks;
 
     SparseDict_INVARIANT(self);
-    assert(self->max_items != new_max_items || self->num_deleted != 0);
 
     new_blocks = PyMem_NEW(sparseblock, num_blocks);
     if (new_blocks == NULL) {
@@ -582,7 +587,7 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
     self->num_blocks = num_blocks;
     self->num_items -= self->num_deleted;
     self->num_deleted = 0;
-    self->max_items = new_max_items;
+    self->_max_items = new_max_items | self->_max_items & FLAGS_MASK; /* Preserve flags */
 
     SparseDict_INVARIANT(self);
     return 0;
@@ -1010,7 +1015,6 @@ static PyObject *
 dict_mp_subscript(SparseDictObject *self, PyObject *key)
 {
     dictentry *entry = (self->lookup)(self, key, -1, 0);
-
     if (entry == NULL)
         return NULL;
     if (entry->key == NULL) {
@@ -1187,7 +1191,6 @@ dict_py_copy(SparseDictObject *self)
     if (copy == NULL)
         return NULL;
 
-    copy->lookup = self->lookup;
     if (dict_merge(copy, (PyObject *)self) != 0) {
         Py_DECREF(copy);
         return NULL;
@@ -1384,7 +1387,7 @@ dict_py_dump(SparseDictObject *self)
             hist_max = hist[i];
 
     fprintf(stderr, "\n\nSparseDict:\nmax_items = %d\nnum_items = %d\nnum_blocks = %d\n",
-        self->max_items, self->num_items, self->num_blocks);
+        SparseDict_MAX_ITEMS(self), self->num_items, self->num_blocks);
     fprintf(stderr, "block size distribution:\n");
     for (i = 0; i <= SPARSEBLOCK_SIZE; ++i)
         fprintf(stderr, "%4d: %-4d %10d\n", i, hist[i]);
@@ -1876,13 +1879,20 @@ static PyObject *
 dictview_tp_repr(dictviewobject *dv)
 {
     PyObject *seq;
+    PyObject *seq_str;
     PyObject *result;
 
     seq = PySequence_List((PyObject *)dv);
     if (seq == NULL)
         return NULL;
 
-    result = PyString_FromFormat("%s(%R)", Py_TYPE(dv)->tp_name, seq);
+#if PY_MAJOR_VERSION < 3
+    seq_str = PyObject_Repr(seq);
+    result = PyString_FromFormat("%s(%s)", Py_TYPE(dv)->tp_name, PyString_AS_STRING(seq_str));
+    Py_DECREF(seq_str);
+#else
+    result = PyString_FromFormat("%s(%R)", Py_TYPE(dv)->tp_name, seq_str);
+#endif
     Py_DECREF(seq);
     return result;
 }
@@ -1892,7 +1902,7 @@ dictkeys_tp_iter(dictviewobject *dv)
 {
     if (dv->sdict == NULL)
         Py_RETURN_NONE;
-    return dictiter_new(dv->sdict, &PyDictIterKey_Type);
+    return dictiter_new(dv->sdict, &SparseDictIterKey_Type);
 }
 
 static int
@@ -2021,13 +2031,12 @@ dictviews_py_isdisjoint(PyObject *self, PyObject *other)
     Py_RETURN_TRUE;
 }
 
-
 static PyObject *
 dictvalues_tp_iter(dictviewobject *dv)
 {
     if (dv->sdict == NULL)
         Py_RETURN_NONE;
-    return dictiter_new(dv->sdict, &PyDictIterValue_Type);
+    return dictiter_new(dv->sdict, &SparseDictIterValue_Type);
 }
 
 static PyObject *
@@ -2035,26 +2044,28 @@ dictitems_tp_iter(dictviewobject *dv)
 {
     if (dv->sdict == NULL)
         Py_RETURN_NONE;
-    return dictiter_new(dv->sdict, &PyDictIterItem_Type);
+    return dictiter_new(dv->sdict, &SparseDictIterItem_Type);
 }
 
 static int
-dictitems_contains(dictviewobject *dv, PyObject *obj)
+dictitems_sq_contains(dictviewobject *dv, PyObject *obj)
 {
-    PyObject *key, *value, *found;
+    PyObject *key, *value;
+    dictentry *entry;
+
     if (dv->sdict == NULL)
         return 0;
     if (!PyTuple_Check(obj) || PyTuple_GET_SIZE(obj) != 2)
         return 0;
     key = PyTuple_GET_ITEM(obj, 0);
     value = PyTuple_GET_ITEM(obj, 1);
-    found = PyDict_GetItem((PyObject *)dv->sdict, key);
-    if (found == NULL) {
-        if (PyErr_Occurred())
-            return -1;
+
+    entry = (dv->sdict->lookup)(dv->sdict, key, -1, 0);
+    if (entry == NULL)
+        return -1;
+    if (entry->key == NULL)
         return 0;
-    }
-    return PyObject_RichCompareBool(value, found, Py_EQ);
+    return PyObject_RichCompareBool(value, entry->value, Py_EQ);
 }
 
 
@@ -2073,6 +2084,7 @@ static PyNumberMethods dictviews_as_number = {
     0,                                  /*nb_add*/
     (binaryfunc)dictviews_nb_sub,       /*nb_subtract*/
     0,                                  /*nb_multiply*/
+    0,                                  /*nb_divide*/
     0,                                  /*nb_remainder*/
     0,                                  /*nb_divmod*/
     0,                                  /*nb_power*/
@@ -2088,7 +2100,7 @@ static PyNumberMethods dictviews_as_number = {
     (binaryfunc)dictviews_nb_or,        /*nb_or*/
 };
 
-static PyMethodDef dictkeys_methods[] = {
+static PyMethodDef dictviews_methods[] = {
     {"isdisjoint",      (PyCFunction)dictviews_py_isdisjoint,  METH_O},
     {NULL,              NULL}           /* sentinel */
 };
@@ -2098,7 +2110,6 @@ PyTypeObject SparseDictKeys_Type = {
     "SparseDict_Keys",                          /* tp_name */
     sizeof(dictviewobject),                     /* tp_basicsize */
     0,                                          /* tp_itemsize */
-    /* methods */
     (destructor)dictview_tp_dealloc,            /* tp_dealloc */
     0,                                          /* tp_print */
     0,                                          /* tp_getattr */
@@ -2114,7 +2125,7 @@ PyTypeObject SparseDictKeys_Type = {
     PyObject_GenericGetAttr,                    /* tp_getattro */
     0,                                          /* tp_setattro */
     0,                                          /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,    /* tp_flags */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_CHECKTYPES,    /* tp_flags */
     0,                                          /* tp_doc */
     (traverseproc)dictview_tp_traverse,         /* tp_traverse */
     0,                                          /* tp_clear */
@@ -2122,7 +2133,7 @@ PyTypeObject SparseDictKeys_Type = {
     0,                                          /* tp_weaklistoffset */
     (getiterfunc)dictkeys_tp_iter,              /* tp_iter */
     0,                                          /* tp_iternext */
-    dictkeys_methods,                           /* tp_methods */
+    dictviews_methods,                          /* tp_methods */
 };
 
 static PySequenceMethods dictitems_as_sequence = {
@@ -2133,12 +2144,7 @@ static PySequenceMethods dictitems_as_sequence = {
     0,                                  /* sq_slice */
     0,                                  /* sq_ass_item */
     0,                                  /* sq_ass_slice */
-    (objobjproc)dictitems_contains,     /* sq_contains */
-};
-
-static PyMethodDef dictitems_methods[] = {
-    {"isdisjoint",      (PyCFunction)dictviews_py_isdisjoint,  METH_O},
-    {NULL,              NULL}           /* sentinel */
+    (objobjproc)dictitems_sq_contains,  /* sq_contains */
 };
 
 PyTypeObject SparseDictItems_Type = {
@@ -2146,7 +2152,6 @@ PyTypeObject SparseDictItems_Type = {
     "SparseDict_Items",                         /* tp_name */
     sizeof(dictviewobject),                     /* tp_basicsize */
     0,                                          /* tp_itemsize */
-    /* methods */
     (destructor)dictview_tp_dealloc,            /* tp_dealloc */
     0,                                          /* tp_print */
     0,                                          /* tp_getattr */
@@ -2162,7 +2167,7 @@ PyTypeObject SparseDictItems_Type = {
     PyObject_GenericGetAttr,                    /* tp_getattro */
     0,                                          /* tp_setattro */
     0,                                          /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,    /* tp_flags */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_CHECKTYPES,    /* tp_flags */
     0,                                          /* tp_doc */
     (traverseproc)dictview_tp_traverse,         /* tp_traverse */
     0,                                          /* tp_clear */
@@ -2170,7 +2175,7 @@ PyTypeObject SparseDictItems_Type = {
     0,                                          /* tp_weaklistoffset */
     (getiterfunc)dictitems_tp_iter,             /* tp_iter */
     0,                                          /* tp_iternext */
-    dictitems_methods,                          /* tp_methods */
+    dictviews_methods,                          /* tp_methods */
 };
 
 static PySequenceMethods dictvalues_as_sequence = {
@@ -2181,7 +2186,7 @@ static PySequenceMethods dictvalues_as_sequence = {
     0,                                  /* sq_slice */
     0,                                  /* sq_ass_item */
     0,                                  /* sq_ass_slice */
-    (objobjproc)0,                      /* sq_contains */
+    0,                                  /* sq_contains */
 };
 
 PyTypeObject SparseDictValues_Type = {
@@ -2189,7 +2194,6 @@ PyTypeObject SparseDictValues_Type = {
     "SparseDict_Values",                        /* tp_name */
     sizeof(dictviewobject),                     /* tp_basicsize */
     0,                                          /* tp_itemsize */
-    /* methods */
     (destructor)dictview_tp_dealloc,            /* tp_dealloc */
     0,                                          /* tp_print */
     0,                                          /* tp_getattr */
@@ -2249,7 +2253,7 @@ PyMODINIT_FUNC PyInit__sparsedict()
 {
 	static PyModuleDef module_def = {
 		PyModuleDef_HEAD_INIT,
-		"sparsecoll",
+		"_sparsedict",
 	};
 	PyObject *module = PyModule_Create(&module_def);
 	if (module == NULL)
