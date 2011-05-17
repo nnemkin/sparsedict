@@ -35,6 +35,8 @@ typedef long Py_hash_t;
 #if PY_MAJOR_VERSION < 3
 #define PyDict_GetItemWithError PyDict_GetItem
 #else
+#define PyInt_FromLong               PyLong_FromLong
+#define PyInt_FromSize_t             PyLong_FromSize_t
 #define PyInt_FromSsize_t            PyLong_FromSsize_t
 #define PyInt_AsSsize_t              PyLong_AsSsize_t
 #define PyString_FromString          PyUnicode_FromString
@@ -758,7 +760,8 @@ dict_update_common(SparseDictObject *self, PyObject *args, PyObject *kwds, char 
     PyObject *arg = NULL;
     int result = 0;
 
-    if (!PyArg_UnpackTuple(args, methname, 0, 1, &arg))
+    /* args == NULL means they were consubed by the caller */
+    if (args != NULL && !PyArg_UnpackTuple(args, methname, 0, 1, &arg))
         return -1;
 
     if (arg != NULL) {
@@ -861,6 +864,18 @@ dict_tp_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 static int
 dict_tp_init(SparseDictObject *self, PyObject *args, PyObject *kwds)
 {
+    if (PyTuple_CheckExact(args) &&
+        PyTuple_GET_SIZE(args) == 1 &&
+        PyInt_Check(PyTuple_GET_ITEM(args, 0))) {
+
+        Py_ssize_t size_hint = PyInt_AsSsize_t(PyTuple_GET_ITEM(args, 0));
+        if (size_hint == -1 && PyErr_Occurred())
+            return -1;
+        if (dict_resize_delta(self, size_hint) != 0)
+            return -1;
+        args = NULL; /* do not pass args to dict_update_common */
+    }
+
     return dict_update_common(self, args, kwds, "SparseDict");
 }
 
@@ -892,10 +907,10 @@ dict_tp_repr(SparseDictObject *self)
 
     i = Py_ReprEnter((PyObject *)self);
     if (i != 0)
-        return i > 0 ? PyString_FromString("{...}") : NULL;
+        return i > 0 ? PyString_FromString("SparseDict(...)") : NULL;
 
     if (SparseDict_SIZE(self) == 0) {
-        result = PyString_FromString("{}");
+        result = PyString_FromString("SparseDict()");
         goto Done;
     }
 
@@ -929,7 +944,7 @@ dict_tp_repr(SparseDictObject *self)
 
     /* Add "{}" decorations to the first and last items. */
     assert(PyList_GET_SIZE(pieces) > 0);
-    s = PyString_FromString("{");
+    s = PyString_FromString("SparseDict({");
     if (s == NULL)
         goto Done;
     temp = PyList_GET_ITEM(pieces, 0);
@@ -939,7 +954,7 @@ dict_tp_repr(SparseDictObject *self)
     if (s == NULL)
         goto Done;
 
-    s = PyString_FromString("}");
+    s = PyString_FromString("})");
     if (s == NULL)
         goto Done;
     temp = PyList_GET_ITEM(pieces, PyList_GET_SIZE(pieces) - 1);
@@ -1411,15 +1426,15 @@ dict_py_stats(SparseDictObject *self)
     if (result == NULL)
         return NULL;
 
-    pydict_set_and_delete(result, "block_size", PyLong_FromLong(SPARSEBLOCK_SIZE));
-    pydict_set_and_delete(result, "num_blocks", PyLong_FromSsize_t(self->num_blocks));
-    pydict_set_and_delete(result, "max_items", PyLong_FromSsize_t(SparseDict_MAX_ITEMS(self)));
-    pydict_set_and_delete(result, "num_items", PyLong_FromSsize_t(self->num_items));
-    pydict_set_and_delete(result, "num_deleted", PyLong_FromSsize_t(self->num_deleted));
-    pydict_set_and_delete(result, "consider_shrink", PyBool_FromLong(self->_max_items & FLAG_CONSIDER_SHRINK));
-    pydict_set_and_delete(result, "string_lookup", PyBool_FromLong(self->lookup == dict_lookup_string));
-    EX_STATS(pydict_set_and_delete(result, "total_collisions", PyLong_FromSize_t(self->total_collisions)));
-    EX_STATS(pydict_set_and_delete(result, "total_resizes", PyLong_FromSize_t(self->total_resizes)));
+    pydict_set_and_delete(result, "block_size", PyInt_FromLong(SPARSEBLOCK_SIZE));
+    pydict_set_and_delete(result, "num_blocks", PyInt_FromSsize_t(self->num_blocks));
+    pydict_set_and_delete(result, "max_items", PyInt_FromSsize_t(SparseDict_MAX_ITEMS(self)));
+    pydict_set_and_delete(result, "num_items", PyInt_FromSsize_t(self->num_items));
+    pydict_set_and_delete(result, "num_deleted", PyInt_FromSsize_t(self->num_deleted));
+    pydict_set_and_delete(result, "consider_shrink", PyInt_FromLong(self->_max_items & FLAG_CONSIDER_SHRINK));
+    pydict_set_and_delete(result, "string_lookup", PyInt_FromLong(self->lookup == dict_lookup_string));
+    EX_STATS(pydict_set_and_delete(result, "total_collisions", PyInt_FromSize_t(self->total_collisions)));
+    EX_STATS(pydict_set_and_delete(result, "total_resizes", PyInt_FromSize_t(self->total_resizes)));
 
     hist_list = PyList_New(SPARSEBLOCK_SIZE + 1);
     if (hist_list == NULL) {
@@ -1442,10 +1457,44 @@ dict_py_stats(SparseDictObject *self)
     return result;
 }
 
+static PyObject *
+dict_py_reduce(SparseDictObject *self)
+{
+    PyObject *result = NULL, *size = NULL, *args = NULL, *state = NULL, *iteritems = NULL;
+
+    size = PyInt_FromSsize_t(SparseDict_SIZE(self));
+    if (size == NULL)
+        goto Done;
+    /* Args to the constructor. */
+    args = PyTuple_Pack(1, size);
+    if (args == NULL)
+        goto Done;
+    /* Subclass' __dict__ to be restored by object.__setstate__ */
+    state = PyObject_GetAttrString((PyObject *)self, "__dict__");
+    if (state == NULL) {
+        PyErr_Clear();
+        state = Py_None;
+        Py_INCREF(state);
+    }
+    /* Dict item iterator to support batch pickling. */
+    iteritems = dictiter_new(self, &SparseDictIterItem_Type);
+    if (iteritems == NULL)
+        goto Done;
+
+    result = PyTuple_Pack(5, Py_TYPE(self), args, state, Py_None, iteritems);
+Done:
+    Py_XDECREF(size);
+    Py_XDECREF(args);
+    Py_XDECREF(state);
+    Py_XDECREF(iteritems);
+    return result;
+}
+
 static PyMethodDef dict_methods[] = {
     {"__sizeof__",  (PyCFunction)dict_py_sizeof,       METH_NOARGS}, /* sys.getsizeof support */
     {"__contains__",(PyCFunction)dict_py_contains,     METH_O | METH_COEXIST}, /* shortcut for sq_contains */
     {"__getitem__", (PyCFunction)dict_mp_subscript,    METH_O | METH_COEXIST}, /* shortcut for mp_getitem */
+    {"__reduce__",  (PyCFunction)dict_py_reduce,       METH_NOARGS}, /* pickling support */
     {"get",         (PyCFunction)dict_py_get,          METH_VARARGS},
     {"setdefault",  (PyCFunction)dict_py_setdefault,   METH_VARARGS},
     {"pop",         (PyCFunction)dict_py_pop,          METH_VARARGS},
@@ -1496,7 +1545,7 @@ static PyMappingMethods dict_as_mapping = {
 
 PyTypeObject SparseDict_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    "SparseDict",
+    "_sparsedict.SparseDict",
     sizeof(SparseDictObject),
     0,
     (destructor)dict_tp_dealloc,                /* tp_dealloc */
@@ -1935,7 +1984,7 @@ dictview_tp_repr(dictviewobject *dv)
 
 #if PY_MAJOR_VERSION < 3
     seq_str = PyObject_Repr(seq);
-    result = PyString_FromFormat("%s(%s)", Py_TYPE(dv)->tp_name, PyString_AS_STRING(seq_str));
+    result = PyString_FromFormat("%s(%s)", Py_TYPE(dv)->tp_name, PyBytes_AS_STRING(seq_str));
     Py_DECREF(seq_str);
 #else
     result = PyString_FromFormat("%s(%R)", Py_TYPE(dv)->tp_name, seq_str);

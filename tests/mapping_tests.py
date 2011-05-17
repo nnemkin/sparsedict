@@ -629,12 +629,12 @@ class TestHashMappingProtocol(TestMappingProtocol):
 
     def test_repr(self):
         d = self._empty_mapping()
-        self.assertEqual(repr(d), '{}')
+        self.assertEqual(repr(d), 'SparseDict()')
         d[1] = 2
-        self.assertEqual(repr(d), '{1: 2}')
+        self.assertEqual(repr(d), 'SparseDict({1: 2})')
         d = self._empty_mapping()
         d[1] = d
-        self.assertEqual(repr(d), '{1: {...}}')
+        self.assertEqual(repr(d), 'SparseDict({1: SparseDict(...)})')
 
         class Exc(Exception): pass
 

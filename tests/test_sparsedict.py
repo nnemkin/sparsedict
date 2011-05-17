@@ -6,12 +6,17 @@ import unittest
 import weakref
 import gc
 import random
+import pickle
 from . import mapping_tests
 from sparsedict import SparseDict
 
 
 class SparseDictSubclass(SparseDict):
-    pass
+
+    def __init__(self, *args, **kwargs):
+        SparseDict.__init__(self, *args, **kwargs)
+        self.a = 'aval' # to test unpickling
+        self.b = 'bval'
 
 
 class TestGeneralMapping(mapping_tests.TestHashMappingProtocol):
@@ -201,3 +206,27 @@ class TestSparseDictAsDict(unittest.TestCase):
         class MyDict(dict):
             pass
         self._tracked(MyDict())
+
+    def test_pickle(self):
+        d = SparseDict({1: 'a', 'b': 2, ('c',): [3, 4]})
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            pd = pickle.loads(pickle.dumps(d, proto))
+            self.assertEquals(d, pd)
+
+        d = SparseDictSubclass({1: 'a', 'b': 2, ('c',): [3, 4]})
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            pd = pickle.loads(pickle.dumps(d, proto))
+            self.assertEquals(d, pd)
+            self.assertEquals(pd.a, 'aval')
+            self.assertEquals(pd.b, 'bval')
+
+    def test_repr_roundtrip(self):
+        d = SparseDict()
+        pd = eval(repr(d))
+        self.assertEqual(d, pd)
+        self.assertIs(type(d), type(pd))
+
+        d = SparseDict({1: 'a', 'b': 2, ('c',): [3, 4]})
+        pd = eval(repr(d))
+        self.assertEqual(d, pd)
+        self.assertIs(type(d), type(pd))
