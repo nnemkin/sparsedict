@@ -35,6 +35,7 @@ typedef long Py_hash_t;
 #if PY_MAJOR_VERSION < 3
 #define PyDict_GetItemWithError PyDict_GetItem
 #else
+#define PyInt_Check                  PyLong_Check
 #define PyInt_FromLong               PyLong_FromLong
 #define PyInt_FromSize_t             PyLong_FromSize_t
 #define PyInt_FromSsize_t            PyLong_FromSsize_t
@@ -2025,7 +2026,7 @@ dictview_tp_repr(dictviewobject *dv)
     result = PyString_FromFormat("%s(%s)", Py_TYPE(dv)->tp_name, PyBytes_AS_STRING(seq_str));
     Py_DECREF(seq_str);
 #else
-    result = PyString_FromFormat("%s(%R)", Py_TYPE(dv)->tp_name, seq_str);
+    result = PyString_FromFormat("%s(%R)", Py_TYPE(dv)->tp_name, seq);
 #endif
     Py_DECREF(seq);
     return result;
