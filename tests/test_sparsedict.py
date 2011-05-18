@@ -230,3 +230,27 @@ class TestSparseDictAsDict(unittest.TestCase):
         pd = eval(repr(d))
         self.assertEqual(d, pd)
         self.assertIs(type(d), type(pd))
+
+    def test_resize_reentrancy(self):
+        d = SparseDict()
+        class Key(int):
+            resize = False
+            def __hash__(self):
+                if self.resize:
+                    d.resize(128)
+                return int.__hash__(self)
+
+        d[Key(0)] = 0
+        Key.resize = True
+        self.assertRaises(RuntimeError, lambda: d.resize(64))
+
+    def test_shrink_to_static(self):
+        d = SparseDict()
+        d[0] = 0
+        static_size = d.__sizeof__()
+        for i in xrange(100):
+            d[i] = i
+        for i in xrange(100):
+            del d[i]
+        d[0] = 0
+        self.assertEqual(d.__sizeof__(), static_size)

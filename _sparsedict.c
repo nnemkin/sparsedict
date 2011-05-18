@@ -91,7 +91,8 @@ struct _sparsedictobject {
 /* Number of items is always a power of 2 >= INITIAL_ITEMS therefore
    we have the lower bits available for flags. */
 #define FLAG_CONSIDER_SHRINK 1 /* Set in dict_delete, cleared in dict_resize_delta. */
-#define FLAGS_MASK           1
+#define FLAG_DISABLE_RESIZE  2 /* Used in resize and equals. */
+#define FLAGS_MASK           3
 
 /* sparseblock methods */
 
@@ -236,6 +237,7 @@ PyTypeObject SparseDictItems_Type;
         assert((sdict)->num_deleted <= (sdict)->num_items); \
     } while (0)
 
+/* Iterator over allocated items in all blocks. Cannot be nested. */
 #define SparseDict_FOR(sdict, entry) \
     { \
         Py_ssize_t i__; \
@@ -557,17 +559,24 @@ Py_LOCAL(int)
 dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
 {
     Py_ssize_t max_items_mask = new_max_items - 1;
-    Py_ssize_t num_blocks = (new_max_items + SPARSEBLOCK_SIZE - 1) / SPARSEBLOCK_SIZE;
+    Py_ssize_t num_new_blocks = (new_max_items + SPARSEBLOCK_SIZE - 1) / SPARSEBLOCK_SIZE;
     sparseblock *new_blocks;
+    Py_ssize_t i;
 
     SparseDict_INVARIANT(self);
 
-    new_blocks = PyMem_NEW(sparseblock, num_blocks);
+    if (self->_max_items & FLAG_DISABLE_RESIZE) {
+        PyErr_SetString(PyExc_RuntimeError, "SparseDict: resize is not reentrant");
+        return -1;
+    }
+    self->_max_items |= FLAG_DISABLE_RESIZE;
+
+    new_blocks = PyMem_NEW(sparseblock, num_new_blocks);
     if (new_blocks == NULL) {
         PyErr_NoMemory();
         return -1;
     }
-    memset(new_blocks, 0, num_blocks * sizeof(sparseblock));
+    memset(new_blocks, 0, num_new_blocks * sizeof(sparseblock));
 
     SparseDict_FOR(self, entry)
         dictentry *new_entry;
@@ -595,23 +604,42 @@ dict_resize(SparseDictObject *self, Py_ssize_t new_max_items)
         new_entry = sparseblock_insert(&new_blocks[i / SPARSEBLOCK_SIZE], i % SPARSEBLOCK_SIZE);
         if (new_entry == NULL)
             goto Failed;
-        *new_entry = entry;
-    SparseDict_ENDFOR(self, 1)
 
-    self->blocks = new_blocks;
-    self->num_blocks = num_blocks;
+        *new_entry = entry;
+        /* Note: we do not use destructive iteration here. It has minimal impact on
+           memory usage during the resize but allows easy recover from hash and memory errors. */
+    SparseDict_ENDFOR(self, 0)
+
+    /* Free old blocks. */
+    for (i = 0; i < self->num_blocks; ++i)
+        PyMem_FREE(self->blocks[i].items);
+    if (self->blocks != self->static_blocks)
+        PyMem_FREE(self->blocks);
+
+    /* Update self with new blocks. */
+    if (num_new_blocks == 1) {
+        self->static_blocks[0] = new_blocks[0];
+        self->blocks = self->static_blocks;
+        PyMem_FREE(new_blocks);
+    }
+    else {
+        self->blocks = new_blocks;
+    }
+    self->_max_items = new_max_items; /* All flags are cleared */
+    self->num_blocks = num_new_blocks;
     self->num_items -= self->num_deleted;
     self->num_deleted = 0;
-    self->_max_items = new_max_items | (self->_max_items & FLAGS_MASK); /* Preserve flags */
-
     EX_STATS(++self->total_resizes);
+
     SparseDict_INVARIANT(self);
     return 0;
 
 Failed:
-    /* Recovery is impossible. */
-    PyMem_FREE(new_blocks);
-    assert(0); // TODO XXXXXXXXXXXXXX
+    /* Discard partial new_blocks. */
+    for (i = 0; i < num_new_blocks; ++i)
+        PyMem_FREE(new_blocks[i].items);
+    if (new_blocks != self->blocks)
+        PyMem_FREE(new_blocks);
     return -1;
 }
 
@@ -788,6 +816,7 @@ Py_LOCAL(int)
 dict_equal(SparseDictObject *self, PyObject *arg)
 {
     SparseDictObject *other = NULL;
+    int result = 1;
 
     SparseDict_INVARIANT(self);
 
@@ -805,13 +834,11 @@ dict_equal(SparseDictObject *self, PyObject *arg)
         return 0;
     }
 
-    // XXX: protect from modification?
-
+    self->_max_items |= FLAG_DISABLE_RESIZE;
     SparseDict_FOR(self, entry)
         PyObject *key = entry.key;
         PyObject *value = entry.value;
         PyObject *value2;
-        int cmp;
 
         Py_INCREF(key);
         Py_INCREF(value);
@@ -819,27 +846,32 @@ dict_equal(SparseDictObject *self, PyObject *arg)
             /* comparing with another SparseDict */
             dictentry *entry2 = (other->lookup)(other, key, -1, 0);
             Py_DECREF(key);
-            if (entry2 == NULL)
-                return -1;
-            if (entry2->key == NULL)
-                return 0;
+            if (entry2 == NULL || entry2->key == NULL) {
+                Py_DECREF(value);
+                result = (entry2 == NULL) ? -1 : 0;
+                break;
+            }
             value2 = entry2->value;
         }
         else {
             /* comparing with PyDictObject */
             value2 = PyDict_GetItemWithError(arg, key);
+            Py_DECREF(key);
             if (value2 == NULL) {
                 Py_DECREF(value);
-                return PyErr_Occurred() ? -1 : 0;
+                result = PyErr_Occurred() ? -1 : 0;
+                break;
             }
         }
 
-        cmp = PyObject_RichCompareBool(value, value2, Py_EQ);
+        result = PyObject_RichCompareBool(value, value2, Py_EQ);
         Py_DECREF(value);
-        if (cmp <= 0)  /* error or not equal */
-            return cmp;
+        if (result <= 0)  /* error or not equal */
+            break;
     SparseDict_ENDFOR(self, 0)
-    return 1;
+    
+    self->_max_items &= ~FLAG_DISABLE_RESIZE;
+    return result;
 }
 
 /* SparseDict type methods */
@@ -1431,7 +1463,8 @@ dict_py_stats(SparseDictObject *self)
     pydict_set_and_delete(result, "max_items", PyInt_FromSsize_t(SparseDict_MAX_ITEMS(self)));
     pydict_set_and_delete(result, "num_items", PyInt_FromSsize_t(self->num_items));
     pydict_set_and_delete(result, "num_deleted", PyInt_FromSsize_t(self->num_deleted));
-    pydict_set_and_delete(result, "consider_shrink", PyInt_FromLong(self->_max_items & FLAG_CONSIDER_SHRINK));
+    pydict_set_and_delete(result, "consider_shrink", PyBool_FromLong(self->_max_items & FLAG_CONSIDER_SHRINK));
+    pydict_set_and_delete(result, "disable_resize", PyBool_FromLong(self->_max_items & FLAG_DISABLE_RESIZE));
     pydict_set_and_delete(result, "string_lookup", PyInt_FromLong(self->lookup == dict_lookup_string));
     EX_STATS(pydict_set_and_delete(result, "total_collisions", PyInt_FromSize_t(self->total_collisions)));
     EX_STATS(pydict_set_and_delete(result, "total_resizes", PyInt_FromSize_t(self->total_resizes)));
