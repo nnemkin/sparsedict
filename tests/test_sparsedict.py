@@ -2,7 +2,7 @@
 #   * test SparseDict() instead of dict()
 #   * some tests for dict()-specific bugs are dropped
 
-import unittest
+import unittest2 as unittest
 import weakref
 import gc
 import random
@@ -42,7 +42,11 @@ class TestSparseDictAsDict(unittest.TestCase):
         d = SparseDict()
         with self.assertRaises(KeyError) as c:
             d[(1,)]
-        self.assertEqual(c.exception.args, ((1,),))
+        if isinstance(c.exception, Exception):
+            self.assertEqual(c.exception.args, ((1,),))
+        else:
+            # work around 2.6 bug (issue 7853)
+            self.assertEqual(c.exception, ((1,),))
 
     def test_bad_key(self):
         # Dictionary lookups should fail if __cmp__() raises an exception.
@@ -121,6 +125,7 @@ class TestSparseDictAsDict(unittest.TestCase):
         gc.collect()
         self.assertTrue(gc.is_tracked(t), t)
 
+    @unittest.skipIf(not hasattr(gc, 'is_tracked'), 'missing gc.is_tracked')
     def test_track_literals(self):
         # Test GC-optimization of dict literals
         x, y, z, w = 1.5, "a", (1, None), []
@@ -139,6 +144,7 @@ class TestSparseDictAsDict(unittest.TestCase):
         self._tracked(SparseDict({1: {}}))
         self._tracked(SparseDict({1: set()}))
 
+    @unittest.skipIf(not hasattr(gc, 'is_tracked'), 'missing gc.is_tracked')
     def test_track_dynamic(self):
         # Test GC-optimization of dynamically-created dicts
         class MyObject(object):
@@ -203,6 +209,7 @@ class TestSparseDictAsDict(unittest.TestCase):
         d.update([(x, y), (z, w)])
         self._tracked(d)
 
+    @unittest.skipIf(not hasattr(gc, 'is_tracked'), 'missing gc.is_tracked')
     def test_track_subtypes(self):
         # SparseDict subtypes are always tracked
         class MyDict(SparseDict):

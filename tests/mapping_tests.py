@@ -3,7 +3,7 @@
 # * ordering (cmp != 0, le, ge, lt, gt) is not supported
 # * has_key() does not raise Py3k warning
 
-import unittest
+import unittest2 as unittest
 import UserDict
 
 
@@ -68,10 +68,14 @@ class BasicTestMappingProtocol(unittest.TestCase):
             self.assertTrue(d.has_key(k))
         for k in self.other:
             self.assertFalse(d.has_key(k))
+        #contains
+        for k in self.reference:
+            self.assertTrue(k in d)
+        for k in self.other:
+            self.assertFalse(k in d)
         #cmp
         self.assertEqual(cmp(p,p), 0)
         self.assertEqual(cmp(d,d), 0)
-        import sys
         self.assertRaises(TypeError, lambda:cmp(p,d))
         self.assertRaises(TypeError, lambda:cmp(d,p))
         #__non__zero__

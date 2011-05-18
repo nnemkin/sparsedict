@@ -3,7 +3,7 @@
 #   * test SparseDict() instead of dict()
 #   * do not use set literal syntax
 
-import unittest
+import unittest2 as unittest
 from sparsedict import SparseDict
 
 
