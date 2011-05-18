@@ -237,7 +237,7 @@ PyTypeObject SparseDictItems_Type;
         assert((sdict)->num_deleted <= (sdict)->num_items); \
     } while (0)
 
-/* Iterator over allocated items in all blocks. Cannot be nested. */
+/* Iterator over allocated items in all blocks. Cannot be nested. Do not use continue. */
 #define SparseDict_FOR(sdict, entry) \
     { \
         Py_ssize_t i__; \
@@ -258,6 +258,14 @@ PyTypeObject SparseDictItems_Type;
         if (destructive && ((sdict)->blocks != (sdict)->static_blocks)) \
             PyMem_FREE((sdict)->blocks); \
     }
+
+/* Delay GC tracking until the first trackable item is inserted. */
+#define MAINTAIN_TRACKING(sdict, key, value) \
+    do { \
+        if (!_PyObject_GC_IS_TRACKED(sdict)) \
+            if (_PyObject_GC_MAY_BE_TRACKED(key) || _PyObject_GC_MAY_BE_TRACKED(value)) \
+                PyObject_GC_Track(sdict); \
+    } while (0)
 
 /* Forward */
 static PyObject *dictiter_new(SparseDictObject *dict, PyTypeObject *type);
@@ -477,11 +485,7 @@ dict_insert(SparseDictObject *self, PyObject *key, PyObject *value)
         return -1;
     }
 
-    /* Delay GC tracking until the first trackable item is inserted. */
-    if (!_PyObject_GC_IS_TRACKED(self))
-        if (_PyObject_GC_MAY_BE_TRACKED(key) || _PyObject_GC_MAY_BE_TRACKED(value))
-            PyObject_GC_Track(self);
-
+    MAINTAIN_TRACKING(self, key, value);
     if (entry->key != NULL) {
         old_value = entry->value;
         entry->value = value;
@@ -1305,6 +1309,7 @@ dict_py_setdefault(SparseDictObject *self, PyObject *args)
         return NULL;
     if (entry->key == NULL) {
         /* Insert new */
+        MAINTAIN_TRACKING(self, key, value);
         Py_INCREF(key);
         Py_INCREF(value);
         entry->key = key;

@@ -118,6 +118,19 @@ class SparseDictSetTest(unittest.TestCase):
         self.assertEqual(d1.viewkeys() ^ set(d3.viewkeys()),
                          set(['a', 'b', 'd', 'e']))
 
+        self.assertEqual(d1.viewkeys() - d1.viewkeys(), set())
+        self.assertEqual(d1.viewkeys() - d2.viewkeys(), set(['a']))
+        self.assertEqual(d1.viewkeys() - d3.viewkeys(), set(['a', 'b']))
+        self.assertEqual(d1.viewkeys() - set(d1.viewkeys()), set())
+        self.assertEqual(d1.viewkeys() - set(d2.viewkeys()), set(['a']))
+        self.assertEqual(d1.viewkeys() - set(d3.viewkeys()), set(['a', 'b']))
+
+        self.assertFalse(d1.viewkeys().isdisjoint(d2.viewkeys()))
+        self.assertFalse(d1.viewkeys().isdisjoint(set(d2.viewkeys())))
+        self.assertTrue(d1.viewkeys().isdisjoint(d3.viewkeys()))
+        self.assertTrue(d1.viewkeys().isdisjoint(set(d3.viewkeys())))
+
+
     def test_items_set_operations(self):
         d1 = SparseDict({'a': 1, 'b': 2})
         d2 = SparseDict({'a': 2, 'b': 2})
@@ -149,3 +162,12 @@ class SparseDictSetTest(unittest.TestCase):
                          set([('a', 1), ('a', 2)]))
         self.assertEqual(d1.viewitems() ^ d3.viewitems(),
                          set([('a', 1), ('b', 2), ('d', 4), ('e', 5)]))
+
+        self.assertEqual(d1.viewitems() - d1.viewitems(), set())
+        self.assertEqual(d1.viewitems() - d2.viewitems(), set([('a', 1)]))
+        self.assertEqual(d1.viewitems() - d3.viewitems(), set([('a', 1), ('b', 2)]))
+
+        self.assertFalse(d1.viewitems().isdisjoint(d2.viewitems()))
+        self.assertFalse(d1.viewitems().isdisjoint(set(d2.viewitems())))
+        self.assertTrue(d1.viewitems().isdisjoint(d3.viewitems()))
+        self.assertTrue(d1.viewitems().isdisjoint(set(d3.viewitems())))

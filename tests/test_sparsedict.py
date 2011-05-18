@@ -39,7 +39,7 @@ class TestSparseDictAsDict(unittest.TestCase):
 
     def test_tuple_keyerror(self):
         # SF #1576657
-        d = {}
+        d = SparseDict()
         with self.assertRaises(KeyError) as c:
             d[(1,)]
         self.assertEqual(c.exception.args, ((1,),))
@@ -58,7 +58,7 @@ class TestSparseDictAsDict(unittest.TestCase):
                     raise CustomException
                 return other
 
-        d = {}
+        d = SparseDict()
         x1 = BadDictKey()
         x2 = BadDictKey()
         d[x1] = 1
@@ -84,7 +84,7 @@ class TestSparseDictAsDict(unittest.TestCase):
                 if resizing:
                     d.clear()
                 return False
-        d = {}
+        d = SparseDict()
         resizing = False
         d[X()] = 1
         d[X()] = 2
@@ -99,11 +99,11 @@ class TestSparseDictAsDict(unittest.TestCase):
         # Bug #3680: tp_traverse was not implemented for dictiter objects
         class C(object):
             pass
-        iterators = (dict.iteritems, dict.itervalues, dict.iterkeys)
+        iterators = (SparseDict.iteritems, SparseDict.itervalues, SparseDict.iterkeys)
         for i in iterators:
             obj = C()
             ref = weakref.ref(obj)
-            container = {obj: 1}
+            container = SparseDict([(obj, 1)])
             obj.x = i(container)
             del obj, container
             gc.collect()
@@ -125,18 +125,19 @@ class TestSparseDictAsDict(unittest.TestCase):
         # Test GC-optimization of dict literals
         x, y, z, w = 1.5, "a", (1, None), []
 
-        self._not_tracked({})
-        self._not_tracked({x:(), y:x, z:1})
-        self._not_tracked({1: "a", "b": 2})
-        self._not_tracked({1: 2, (None, True, False, ()): int})
-        self._not_tracked({1: object()})
+        self._not_tracked(SparseDict())
+        self._not_tracked(SparseDict({x:(), y:x, z:1}))
+        self._not_tracked(SparseDict({1: "a", "b": 2}))
+        # (None, True, False, ()) tuple is untracked on GC but SparseDict itself is not
+        # self._not_tracked(SparseDict({1: 2, (None, True, False, ()): int}))
+        self._not_tracked(SparseDict({1: object()}))
 
         # Dicts with mutable elements are always tracked, even if those
         # elements are not tracked right now.
-        self._tracked({1: []})
-        self._tracked({1: ([],)})
-        self._tracked({1: {}})
-        self._tracked({1: set()})
+        self._tracked(SparseDict({1: []}))
+        self._tracked(SparseDict({1: ([],)}))
+        self._tracked(SparseDict({1: {}}))
+        self._tracked(SparseDict({1: set()}))
 
     def test_track_dynamic(self):
         # Test GC-optimization of dynamically-created dicts
@@ -144,7 +145,7 @@ class TestSparseDictAsDict(unittest.TestCase):
             pass
         x, y, z, w, o = 1.5, "a", (1, object()), [], MyObject()
 
-        d = dict()
+        d = SparseDict()
         self._not_tracked(d)
         d[1] = "a"
         self._not_tracked(d)
@@ -156,54 +157,55 @@ class TestSparseDictAsDict(unittest.TestCase):
         d[4] = w
         self._tracked(d)
         self._tracked(d.copy())
-        d[4] = None
-        self._not_tracked(d)
-        self._not_tracked(d.copy())
+        # Unlike dict, we don't have a _PyDict_MaybeUntrack hook
+        # d[4] = None
+        # self._not_tracked(d)
+        # self._not_tracked(d.copy())
 
         # dd isn't tracked right now, but it may mutate and therefore d
         # which contains it must be tracked.
-        d = dict()
-        dd = dict()
+        d = SparseDict()
+        dd = SparseDict()
         d[1] = dd
         self._not_tracked(dd)
         self._tracked(d)
         dd[1] = d
         self._tracked(dd)
 
-        d = dict.fromkeys([x, y, z])
+        d = SparseDict.fromkeys([x, y, z])
         self._not_tracked(d)
-        dd = dict()
+        dd = SparseDict()
         dd.update(d)
         self._not_tracked(dd)
-        d = dict.fromkeys([x, y, z, o])
+        d = SparseDict.fromkeys([x, y, z, o])
         self._tracked(d)
-        dd = dict()
+        dd = SparseDict()
         dd.update(d)
         self._tracked(dd)
 
-        d = dict(x=x, y=y, z=z)
+        d = SparseDict(x=x, y=y, z=z)
         self._not_tracked(d)
-        d = dict(x=x, y=y, z=z, w=w)
+        d = SparseDict(x=x, y=y, z=z, w=w)
         self._tracked(d)
-        d = dict()
+        d = SparseDict()
         d.update(x=x, y=y, z=z)
         self._not_tracked(d)
         d.update(w=w)
         self._tracked(d)
 
-        d = dict([(x, y), (z, 1)])
+        d = SparseDict([(x, y), (z, 1)])
         self._not_tracked(d)
-        d = dict([(x, y), (z, w)])
+        d = SparseDict([(x, y), (z, w)])
         self._tracked(d)
-        d = dict()
+        d = SparseDict()
         d.update([(x, y), (z, 1)])
         self._not_tracked(d)
         d.update([(x, y), (z, w)])
         self._tracked(d)
 
     def test_track_subtypes(self):
-        # Dict subtypes are always tracked
-        class MyDict(dict):
+        # SparseDict subtypes are always tracked
+        class MyDict(SparseDict):
             pass
         self._tracked(MyDict())
 
@@ -254,3 +256,11 @@ class TestSparseDictAsDict(unittest.TestCase):
             del d[i]
         d[0] = 0
         self.assertEqual(d.__sizeof__(), static_size)
+
+    def test_stats(self):
+        d = SparseDict({1: 'a', 'b': 2, ('c',): [3, 4]})
+        stats = d._stats()
+        self.assertIsInstance(stats, dict, stats)
+        for key in ["block_size", "num_blocks", "max_items", "num_items", "num_deleted",
+                    "consider_shrink", "disable_resize", "string_lookup"]:
+            self.assertIn(key, stats, key)
