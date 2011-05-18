@@ -2,6 +2,7 @@
 #   * test SparseDict() instead of dict()
 #   * some tests for dict()-specific bugs are dropped
 
+from __future__ import with_statement
 import unittest2 as unittest
 import weakref
 import gc

@@ -1,6 +1,10 @@
 
-from collections import MutableMapping
 from _sparsedict import SparseDict
 
-MutableMapping.register(SparseDict)
-del MutableMapping
+try:
+    from collections import MutableMapping
+except ImportError:
+    pass
+else:
+    MutableMapping.register(SparseDict)
+    del MutableMapping

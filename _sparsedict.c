@@ -1483,7 +1483,7 @@ dict_py_stats(SparseDictObject *self)
     for (i = 0; i < self->num_blocks; ++i)
         ++hist[self->blocks[i].num_items];
     for (i = 0; i <= SPARSEBLOCK_SIZE; ++i) {
-        value = PyLong_FromSsize_t(hist[i]);
+        value = PyInt_FromSsize_t(hist[i]);
         if (value == NULL) {
             Py_DECREF(result);
             Py_DECREF(hist_list);
