@@ -1,12 +1,7 @@
 
-.. Warning::
-    This project optimizes ``dict``\ 's own memory requirements, but not
-    those of the objects stored within.
-
-    For example, you are unlikely to gain any significant space savings
-    if you store Python's strings in it, because string objects themselves
-    have ridiculous memory overhead (~25 bytes/object).
-
+Warning
+=======
+This project is experimental and not suitable for production use.
 
 SparseDict: memory-efficient dict-like container
 ================================================
